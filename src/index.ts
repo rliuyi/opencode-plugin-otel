@@ -27,6 +27,7 @@ import { handlePermissionUpdated, handlePermissionReplied } from "./handlers/per
 import { handleSessionDiff, handleCommandExecuted } from "./handlers/activity.ts"
 import { agentAttrs, getSessionAgentMeta, setBoundedMap } from "./util.ts"
 import type { SessionTotals } from "./types.ts"
+import { registerAiTelemetry } from "./ai-telemetry.ts"
 
 const PLUGIN_VERSION: string = (pkg as { version?: string }).version ?? "unknown"
 
@@ -56,6 +57,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     protocol: config.protocol,
     metricsInterval: config.metricsInterval,
     logsInterval: config.logsInterval,
+    spanAttributeCountLimit: config.spanAttributeCountLimit,
     metricPrefix: config.metricPrefix,
     headersHelperSet: !!config.otlpHeadersHelper,
   })
@@ -85,6 +87,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     PLUGIN_VERSION,
     config.otlpHeaders,
     otlpHeadersHelper,
+    config.spanAttributeCountLimit,
   )
   const { meterProvider, loggerProvider, tracerProvider } = providers
   await log("info", "OTel SDK initialized")
@@ -115,6 +118,8 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   const sessionSpanContexts = new Map()
   const messageSpans = new Map()
   const messageOutputs = new Map()
+  const activeMessageSpans = new Map()
+  const llmTelemetryOutputs = new Map()
   const { disabledMetrics, disabledTraces } = config
   const commonAttrs = {
     ...parseAttributePairs(config.spanAttributes),
@@ -157,7 +162,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     sessionSpanContexts,
     messageSpans,
     messageOutputs,
+    activeMessageSpans,
+    llmTelemetryOutputs,
   }
+
+  const unregisterAiTelemetry = registerAiTelemetry(ctx)
 
   let shuttingDown = false
 
@@ -194,6 +203,10 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     }
 
   return {
+    dispose: async () => {
+      unregisterAiTelemetry()
+    },
+
     config: async (cfg) => {
       if (cfg.logLevel) {
         const next = resolveLogLevel(cfg.logLevel, minLevel)
@@ -332,6 +345,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
               info.providerID ?? "unknown",
               info.time?.created ?? Date.now(),
               ctx,
+              info.mode,
             )
           }
           await handleMessageUpdated(msgEvt, ctx)

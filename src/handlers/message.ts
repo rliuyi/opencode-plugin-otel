@@ -18,6 +18,8 @@ import {
   LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE,
   LLM_TOKEN_COUNT_TOTAL,
   MimeType,
+  MESSAGE_CONTENT,
+  MESSAGE_ROLE,
   OpenInferenceSpanKind,
   OUTPUT_MIME_TYPE,
   OUTPUT_VALUE,
@@ -66,7 +68,14 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
 
   const { sessionID, modelID, providerID } = assistant
   const duration = assistant.time.completed - assistant.time.created
-  const { agentName, agentType } = getSessionAgentMeta(sessionID, ctx)
+  const sessionAgent = getSessionAgentMeta(sessionID, ctx)
+  const messageAgent = (assistant as AssistantMessage & { agent?: string }).agent ?? assistant.mode
+  const agentName = messageAgent || sessionAgent.agentName
+  const agentType = sessionAgent.agentType
+  const totals = ctx.sessionTotals.get(sessionID)
+  if (messageAgent && totals && totals.agent !== messageAgent) {
+    setBoundedMap(ctx.sessionTotals, sessionID, { ...totals, agent: messageAgent })
+  }
   const agent = agentName
 
   const totalTokens = assistant.tokens.input + assistant.tokens.output + assistant.tokens.reasoning
@@ -117,9 +126,18 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
   })
 
   const msgKey = `${sessionID}:${assistant.id}`
+  const outputText = ctx.messageOutputs.get(msgKey)
+  if (outputText !== undefined) {
+    const outputAttrs = {
+      [OUTPUT_VALUE]: outputText,
+      [OUTPUT_MIME_TYPE]: MimeType.TEXT,
+    }
+    ctx.runSpans.get(assistant.parentID)?.setAttributes(outputAttrs)
+    ctx.sessionSpans.get(sessionID)?.setAttributes(outputAttrs)
+  }
   const msgSpan = ctx.messageSpans.get(msgKey)
   if (msgSpan) {
-    const outputText = ctx.messageOutputs.get(msgKey)
+    const telemetryOutput = ctx.llmTelemetryOutputs.has(msgKey)
     msgSpan.setAttributes({
       [AGENT_NAME]: agentName,
       "agent.type": agentType,
@@ -131,11 +149,12 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
       [LLM_TOKEN_COUNT_TOTAL]: totalTokens,
       [LLM_FINISH_REASON]: assistant.error ? "error" : (assistant.finish ?? "stop"),
       [LLM_COST_TOTAL]: assistant.cost,
-      ...(outputText
+      ...(outputText && !telemetryOutput
         ? {
             [OUTPUT_VALUE]: outputText,
             [OUTPUT_MIME_TYPE]: MimeType.TEXT,
-            [LLM_OUTPUT_MESSAGES]: JSON.stringify([{ role: "assistant", content: outputText }]),
+            [`${LLM_OUTPUT_MESSAGES}.0.${MESSAGE_ROLE}`]: "assistant",
+            [`${LLM_OUTPUT_MESSAGES}.0.${MESSAGE_CONTENT}`]: outputText,
           }
         : {}),
       cost_usd: assistant.cost,
@@ -148,8 +167,12 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
     }
     msgSpan.end(assistant.time.completed)
     ctx.messageSpans.delete(msgKey)
-    ctx.messageOutputs.delete(msgKey)
   }
+  ctx.messageOutputs.delete(msgKey)
+  if (ctx.activeMessageSpans.get(sessionID)?.messageID === assistant.id) {
+    ctx.activeMessageSpans.delete(sessionID)
+  }
+  ctx.llmTelemetryOutputs.delete(msgKey)
 
   if (assistant.error) {
     ctx.emitLog({
@@ -421,12 +444,19 @@ export function startMessageSpan(
   providerID: string,
   startTime: number,
   ctx: HandlerContext,
+  messageAgent?: string,
 ) {
   if (!isTraceEnabled("llm", ctx)) return
   const msgKey = `${sessionID}:${messageID}`
   if (ctx.messageSpans.has(msgKey)) return
   setBoundedMap(ctx.assistantRuns, messageID, parentID)
-  const { agentName, agentType } = getSessionAgentMeta(sessionID, ctx)
+  const sessionAgent = getSessionAgentMeta(sessionID, ctx)
+  const agentName = messageAgent || sessionAgent.agentName
+  const agentType = sessionAgent.agentType
+  const totals = ctx.sessionTotals.get(sessionID)
+  if (messageAgent && totals && totals.agent !== messageAgent) {
+    setBoundedMap(ctx.sessionTotals, sessionID, { ...totals, agent: messageAgent })
+  }
   const inputText = ctx.runInputs.get(parentID)
 
   const msgSpan = ctx.tracer.startSpan(
@@ -442,11 +472,14 @@ export function startMessageSpan(
         [LLM_SYSTEM]: providerID,
         [LLM_PROVIDER]: providerID,
         [LLM_MODEL_NAME]: modelID,
+        [OUTPUT_VALUE]: "",
+        [OUTPUT_MIME_TYPE]: MimeType.TEXT,
         ...(inputText
           ? {
               [INPUT_VALUE]: inputText,
               [INPUT_MIME_TYPE]: MimeType.TEXT,
-              [LLM_INPUT_MESSAGES]: JSON.stringify([{ role: "user", content: inputText }]),
+              [`${LLM_INPUT_MESSAGES}.0.${MESSAGE_ROLE}`]: "user",
+              [`${LLM_INPUT_MESSAGES}.0.${MESSAGE_CONTENT}`]: inputText,
             }
           : {}),
         ...ctx.commonAttrs,
@@ -455,4 +488,5 @@ export function startMessageSpan(
     resolveSessionTraceContext(sessionID, ctx, { runID: parentID, assistantMessageID: messageID }),
   )
   setBoundedMap(ctx.messageSpans, msgKey, msgSpan)
+  setBoundedMap(ctx.activeMessageSpans, sessionID, { messageID, span: msgSpan })
 }

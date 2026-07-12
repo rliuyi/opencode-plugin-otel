@@ -10,7 +10,10 @@ import {
   LLM_TOKEN_COUNT_PROMPT,
   LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ,
   LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE,
+  MimeType,
   OpenInferenceSpanKind,
+  OUTPUT_MIME_TYPE,
+  OUTPUT_VALUE,
   SemanticConventions,
   SESSION_ID,
   TOOL_NAME,
@@ -54,6 +57,7 @@ function makeAssistantMessageUpdated(overrides: {
   sessionID?: string
   modelID?: string
   providerID?: string
+  mode?: string
   cost?: number
   tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
   time?: { created: number; completed?: number }
@@ -69,6 +73,7 @@ function makeAssistantMessageUpdated(overrides: {
         sessionID: overrides.sessionID ?? "ses_1",
         modelID: overrides.modelID ?? "claude-3-5-sonnet",
         providerID: overrides.providerID ?? "anthropic",
+        mode: overrides.mode,
         cost: overrides.cost ?? 0.01,
         tokens: overrides.tokens ?? { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
         time: overrides.time ?? { created: 1000, completed: 2000 },
@@ -96,6 +101,13 @@ function makeToolPartUpdated(
   return {
     type: "message.part.updated",
     properties: { part: { type: "tool", sessionID, messageID, callID, tool: overrides.tool ?? "bash", state } },
+  } as unknown as EventMessagePartUpdated
+}
+
+function makeTextPartUpdated(text: string, sessionID = "ses_1", messageID = "msg_1"): EventMessagePartUpdated {
+  return {
+    type: "message.part.updated",
+    properties: { part: { type: "text", sessionID, messageID, text } },
   } as unknown as EventMessagePartUpdated
 }
 
@@ -253,6 +265,30 @@ describe("session spans", () => {
     expect(tracer.spans[3]!.parentSpanContext?.spanId).toBe(tracer.spans[0]!.spanContext().spanId)
     expect(tracer.spans[3]!.parentSpanContext?.spanId).not.toBe(tracer.spans[2]!.spanContext().spanId)
   })
+
+  test("run span carries the final assistant output", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], ["llm"])
+    handleRunStarted("user_1", "ses_1", "build", "prompt", "anthropic/claude", 1000, ctx)
+    handleMessagePartUpdated(makeTextPartUpdated("final answer"), ctx)
+    handleMessageUpdated(makeAssistantMessageUpdated({ id: "msg_1", parentID: "user_1", mode: "build" }), ctx)
+    expect(tracer.spans[0]!.attributes[OUTPUT_VALUE]).toBe("final answer")
+    expect(tracer.spans[0]!.attributes[OUTPUT_MIME_TYPE]).toBe(MimeType.TEXT)
+  })
+
+  test("subagent session span carries the final assistant output", () => {
+    const { ctx, tracer } = makeCtx("proj_test", [], ["llm"])
+    handleRunStarted("user_parent", "ses_parent", "build", "prompt", "anthropic/claude", 1000, ctx)
+    handleSessionCreated(makeSessionCreated("ses_child", 1100, "ses_parent"), ctx)
+    handleMessagePartUpdated(makeTextPartUpdated("subagent result", "ses_child"), ctx)
+    handleMessageUpdated(makeAssistantMessageUpdated({
+      id: "msg_1",
+      parentID: "user_child",
+      sessionID: "ses_child",
+      mode: "review",
+    }), ctx)
+    expect(tracer.spans[1]!.attributes[OUTPUT_VALUE]).toBe("subagent result")
+    expect(tracer.spans[1]!.attributes[OUTPUT_MIME_TYPE]).toBe(MimeType.TEXT)
+  })
 })
 
 describe("tool spans", () => {
@@ -361,6 +397,14 @@ describe("message (LLM) spans", () => {
     expect(tracer.spans[0]!.attributes[LLM_SYSTEM]).toBe("openai")
     expect(tracer.spans[0]!.attributes[LLM_PROVIDER]).toBe("openai")
     expect(tracer.spans[0]!.attributes[LLM_MODEL_NAME]).toBe("gpt-4o")
+    expect(tracer.spans[0]!.attributes[OUTPUT_VALUE]).toBe("")
+    expect(tracer.spans[0]!.attributes[OUTPUT_MIME_TYPE]).toBe(MimeType.TEXT)
+  })
+
+  test("startMessageSpan uses the assistant message agent", () => {
+    const { ctx, tracer } = makeCtx()
+    startMessageSpan("ses_1", "msg_1", "user_1", "gpt-4o", "openai", 1000, ctx, "build")
+    expect(tracer.spans[0]!.attributes[AGENT_NAME]).toBe("build")
   })
 
   test("startMessageSpan is a no-op when span already exists for sessionID:messageID", () => {
@@ -414,6 +458,15 @@ describe("message (LLM) spans", () => {
     expect(span.attributes[LLM_TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]).toBe(5)
     expect(span.attributes[AGENT_NAME]).toBe("review")
     expect(span.attributes["agent.type"]).toBe("subagent")
+  })
+
+  test("handleMessageUpdated replaces an unknown agent from the assistant message", () => {
+    const { ctx, tracer } = makeCtx()
+    ctx.sessionTotals.set("ses_1", { startMs: 0, tokens: 0, cost: 0, messages: 0, agent: "unknown", agentType: "primary" })
+    startMessageSpan("ses_1", "msg_1", "user_1", "gpt-4o", "openai", 1000, ctx)
+    handleMessageUpdated(makeAssistantMessageUpdated({ id: "msg_1", mode: "build" }), ctx)
+    expect(tracer.spans[0]!.attributes[AGENT_NAME]).toBe("build")
+    expect(ctx.sessionTotals.get("ses_1")!.agent).toBe("build")
   })
 
   test("handleMessageUpdated no-ops span handling when no span exists for messageID", () => {
