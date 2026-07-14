@@ -7,7 +7,7 @@ export const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 } as const
 /** Union of supported log level names. */
 export type Level = keyof typeof LEVELS
 
-/** Maximum number of entries kept in `pendingToolSpans` and `pendingPermissions` maps. */
+/** Maximum number of entries kept in bounded correlation maps and queues. */
 export const MAX_PENDING = 500
 
 /** Structured logger forwarded to the opencode `client.app.log` API. */
@@ -57,6 +57,14 @@ export type Instruments = {
 /** Session role emitted by opencode: either the primary/root agent or a spawned subagent. */
 export type SessionAgentType = "primary" | "subagent"
 
+export type RunDetails = {
+  agentType: SessionAgentType
+  parentSessionID?: string
+  taskCallID?: string
+  taskSpanContext?: SpanContext
+  background?: boolean
+}
+
 /** Accumulated per-session totals used for gauge snapshots on session.idle. */
 export type SessionTotals = {
   startMs: number
@@ -67,12 +75,13 @@ export type SessionTotals = {
   agentType: SessionAgentType
 }
 
-/** Pending root-run metadata captured from `chat.message` until the user message ID is known. */
+/** Pending run metadata captured from `chat.message` until the user message ID is known. */
 export type PendingRun = {
   agent: string
   promptText: string
   model: string
   startTime: number
+  details: RunDetails
 }
 
 /** Shared context threaded through every event handler. */
@@ -93,13 +102,13 @@ export type HandlerContext = {
   runSpans: Map<string, Span>
   runSpanContexts: Map<string, SpanContext>
   activeRuns: Map<string, string>
+  activeRunDetails: Map<string, RunDetails>
   assistantRuns: Map<string, string>
   pendingRuns: Map<string, PendingRun>
+  pendingSubagentRuns: Map<string, RunDetails[]>
   runInputs: Map<string, string>
-  sessionSpans: Map<string, Span>
-  sessionSpanContexts: Map<string, SpanContext>
   messageSpans: Map<string, Span>
   messageOutputs: Map<string, string>
-  activeMessageSpans: Map<string, { messageID: string; span: Span }>
+  activeMessageSpans: Map<string, { messageID: string; span: Span; outputEndTime?: number }>
   llmTelemetryOutputs: Map<string, true>
 }

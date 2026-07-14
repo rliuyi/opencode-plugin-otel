@@ -112,6 +112,13 @@ describe("handleSessionIdle", () => {
     expect(ctx.pendingToolSpans.has("ses_other:call_2")).toBe(true)
   })
 
+  test("sweeps pending subagent run state for the session", () => {
+    const { ctx } = makeCtx()
+    ctx.pendingSubagentRuns.set("ses_child", [{ agentType: "subagent", parentSessionID: "ses_parent" }])
+    handleSessionIdle(makeSessionIdle("ses_child"), ctx)
+    expect(ctx.pendingSubagentRuns.has("ses_child")).toBe(false)
+  })
+
   test("records session duration histogram when totals exist", async () => {
     const { ctx, histograms } = makeCtx()
     await handleSessionCreated(makeSessionCreated("ses_1", Date.now() - 1000), ctx)
@@ -184,9 +191,11 @@ describe("handleSessionError", () => {
     const span = t.startSpan("tool") as unknown as Span
     ctx.pendingPermissions.set("perm_1", { type: "tool", title: "Read", sessionID: "ses_1" })
     ctx.pendingToolSpans.set("ses_1:call_1", { tool: "bash", sessionID: "ses_1", startMs: 0, span })
+    ctx.pendingSubagentRuns.set("ses_1", [{ agentType: "subagent", parentSessionID: "ses_parent" }])
     handleSessionError(makeSessionError("ses_1"), ctx)
     expect(ctx.pendingPermissions.size).toBe(0)
     expect(ctx.pendingToolSpans.size).toBe(0)
+    expect(ctx.pendingSubagentRuns.size).toBe(0)
   })
 
   test("removes sessionTotals entry on error when sessionID is known", async () => {

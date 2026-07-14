@@ -2,7 +2,6 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { SeverityNumber } from "@opentelemetry/api-logs"
 import { logs } from "@opentelemetry/api-logs"
 import { ROOT_CONTEXT, trace } from "@opentelemetry/api"
-import { AGENT_NAME } from "@arizeai/openinference-semantic-conventions"
 import pkg from "../package.json" with { type: "json" }
 import type {
   EventSessionCreated,
@@ -16,7 +15,7 @@ import type {
   EventSessionDiff,
   EventCommandExecuted,
 } from "@opencode-ai/sdk"
-import { LEVELS, type Level, type HandlerContext } from "./types.ts"
+import { LEVELS, type Level, type HandlerContext, type RunDetails } from "./types.ts"
 import { loadConfig, parseAttributePairs, resolveHelperPath, resolveLogLevel, type OtelPluginOptions } from "./config.ts"
 import { probeEndpoint } from "./probe.ts"
 import { setupOtel, createInstruments, forceFlushOtel } from "./otel.ts"
@@ -111,11 +110,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
   const runSpans = new Map()
   const runSpanContexts = new Map()
   const activeRuns = new Map()
+  const activeRunDetails = new Map()
   const assistantRuns = new Map()
   const pendingRuns = new Map()
+  const pendingSubagentRuns = new Map()
   const runInputs = new Map()
-  const sessionSpans = new Map()
-  const sessionSpanContexts = new Map()
   const messageSpans = new Map()
   const messageOutputs = new Map()
   const activeMessageSpans = new Map()
@@ -155,11 +154,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
     runSpans,
     runSpanContexts,
     activeRuns,
+    activeRunDetails,
     assistantRuns,
     pendingRuns,
+    pendingSubagentRuns,
     runInputs,
-    sessionSpans,
-    sessionSpanContexts,
     messageSpans,
     messageOutputs,
     activeMessageSpans,
@@ -202,6 +201,15 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
       }
     }
 
+  function takeRunDetails(sessionID: string, fallback: RunDetails) {
+    const queued = pendingSubagentRuns.get(sessionID)
+    if (!queued?.length) return fallback
+    const [details, ...remaining] = queued
+    if (remaining.length) setBoundedMap(pendingSubagentRuns, sessionID, remaining)
+    else pendingSubagentRuns.delete(sessionID)
+    return details!
+  }
+
   return {
     dispose: async () => {
       unregisterAiTelemetry()
@@ -223,18 +231,17 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
       const agent = input.agent ?? "unknown"
       const startTime = Date.now()
       const existingTotals = sessionTotals.get(input.sessionID)
+      const details = takeRunDetails(input.sessionID, { agentType: existingTotals?.agentType ?? "primary" })
       const nextTotals: SessionTotals = {
         startMs: existingTotals?.startMs ?? startTime,
         tokens: existingTotals?.tokens ?? 0,
         cost: existingTotals?.cost ?? 0,
         messages: existingTotals?.messages ?? 0,
         agent,
-        agentType: existingTotals?.agentType ?? "primary",
+        agentType: details.agentType,
       }
       setBoundedMap(sessionTotals, input.sessionID, nextTotals)
       const { agentType } = getSessionAgentMeta(input.sessionID, ctx)
-      const sessionSpan = sessionSpans.get(input.sessionID)
-      if (sessionSpan) sessionSpan.setAttributes({ [AGENT_NAME]: agent, "agent.type": agentType })
       const promptText = output.parts.map((part) => {
         switch (part.type) {
           case "text":
@@ -249,26 +256,26 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
             return ""
         }
       }).filter(Boolean).join("\n")
-      if (!sessionSpan) {
-        const model = input.model ? `${input.model.providerID}/${input.model.modelID}` : "unknown"
-        if (input.messageID) {
-          handleRunStarted(
-            input.messageID,
-            input.sessionID,
-            agent,
-            promptText,
-            model,
-            startTime,
-            ctx,
-          )
-        } else {
-          setBoundedMap(pendingRuns, input.sessionID, {
-            agent,
-            promptText,
-            model,
-            startTime,
-          })
-        }
+      const model = input.model ? `${input.model.providerID}/${input.model.modelID}` : "unknown"
+      if (input.messageID) {
+        handleRunStarted(
+          input.messageID,
+          input.sessionID,
+          agent,
+          promptText,
+          model,
+          startTime,
+          ctx,
+          details,
+        )
+      } else {
+        setBoundedMap(pendingRuns, input.sessionID, {
+          agent,
+          promptText,
+          model,
+          startTime,
+          details,
+        })
       }
       const promptLength = promptText.length
       emitLog({
@@ -323,7 +330,11 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
           const info = msgEvt.properties.info
           if (info.role === "user") {
             const pendingRun = pendingRuns.get(info.sessionID)
-            if (!sessionSpans.has(info.sessionID) && (pendingRun || activeRuns.get(info.sessionID) !== info.id)) {
+            if (pendingRun || activeRuns.get(info.sessionID) !== info.id) {
+              const sessionAgentType = getSessionAgentMeta(info.sessionID, ctx).agentType
+              const details = pendingRun?.details ?? takeRunDetails(info.sessionID, {
+                agentType: sessionAgentType === "subagent" ? "subagent" : "primary",
+              })
               handleRunStarted(
                 info.id,
                 info.sessionID,
@@ -332,6 +343,7 @@ export const OtelPlugin: Plugin = async ({ project, client, directory, worktree 
                 pendingRun?.model ?? `${info.model.providerID}/${info.model.modelID}`,
                 pendingRun?.startTime ?? info.time.created,
                 ctx,
+                details,
               )
             }
             break

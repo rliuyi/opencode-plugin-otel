@@ -21,7 +21,7 @@ An AI SDK operation is accepted only when both conditions are true:
 1. `functionId` is `session.llm`.
 2. `metadata.sessionId` matches an entry in `HandlerContext.activeMessageSpans`.
 
-`startMessageSpan` creates that active entry when OpenCode emits an incomplete assistant `message.updated` event. The entry associates the session with the current message ID and LLM span. The completed assistant event removes it.
+`startMessageSpan` creates that active entry when OpenCode emits an incomplete assistant `message.updated` event. The entry associates the session with the current message ID, LLM span, and optional model-to-tool handoff time. The completed assistant event removes it.
 
 ```text
 OpenCode message.updated (assistant, incomplete)
@@ -41,10 +41,14 @@ AI SDK onStepFinish
   -> llm.output_messages.*
   -> llmTelemetryOutputs[sessionID:messageID] = true
 
+OpenCode message.part.updated (tool, running)
+  -> activeMessageSpans[sessionID].outputEndTime = latest tool start
+
 OpenCode message.updated (assistant, completed)
   -> token/cost/status attributes
   -> preserve AI SDK output when marker is present
-  -> end span and clear correlation state
+  -> end span at outputEndTime when present
+  -> clear correlation state
 ```
 
 Callbacks from other AI SDK functions are ignored. A callback also has no effect when its plugin context has no active LLM span for the supplied session.

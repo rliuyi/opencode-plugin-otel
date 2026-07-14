@@ -16,14 +16,14 @@ export function errorSummary(err: { name: string; data?: unknown } | undefined):
  * has reached `MAX_PENDING` capacity to prevent unbounded memory growth.
  */
 export function setBoundedMap<K, V>(map: Map<K, V>, key: K, value: V) {
-  if (map.size >= MAX_PENDING) {
+  if (!map.has(key) && map.size >= MAX_PENDING) {
     const [firstKey] = map.keys()
     if (firstKey !== undefined) map.delete(firstKey)
   }
   map.set(key, value)
 }
 
-/** Resolves a root-run context from the live span first, then from the retained ended span context. */
+/** Resolves a run context from the live span first, then from the retained ended span context. */
 export function resolveRunTraceContext(runID: string, ctx: Pick<HandlerContext, "rootContext" | "runSpans" | "runSpanContexts">) {
   const baseCtx = ctx.rootContext()
   const runSpan = ctx.runSpans.get(runID)
@@ -32,17 +32,13 @@ export function resolveRunTraceContext(runID: string, ctx: Pick<HandlerContext, 
   return runSpanContext ? trace.setSpanContext(baseCtx, runSpanContext) : baseCtx
 }
 
-/** Resolves the best available trace parent for a session event or message/tool child span. */
+/** Resolves the best available run context for a session event or child span. */
 export function resolveSessionTraceContext(
   sessionID: string,
   ctx: HandlerContext,
   input?: { assistantMessageID?: string; runID?: string },
 ) {
   const baseCtx = ctx.rootContext()
-  const sessionSpan = ctx.sessionSpans.get(sessionID)
-  if (sessionSpan) return trace.setSpan(baseCtx, sessionSpan)
-  const sessionSpanContext = ctx.sessionSpanContexts.get(sessionID)
-  if (sessionSpanContext) return trace.setSpanContext(baseCtx, sessionSpanContext)
   if (input?.runID) return resolveRunTraceContext(input.runID, ctx)
   const assistantRunID = input?.assistantMessageID
     ? ctx.assistantRuns.get(input.assistantMessageID)

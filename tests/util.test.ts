@@ -62,6 +62,17 @@ describe("setBoundedMap", () => {
     expect(map.get("a")).toBe(2)
     expect(map.size).toBe(1)
   })
+
+  test("overwrites an existing key at capacity without evicting another entry", () => {
+    const map = new Map<string, number>()
+    for (let i = 0; i < MAX_PENDING; i++) {
+      setBoundedMap(map, `key-${i}`, i)
+    }
+    setBoundedMap(map, "key-100", 999)
+    expect(map.size).toBe(MAX_PENDING)
+    expect(map.get("key-100")).toBe(999)
+    expect(map.has("key-0")).toBe(true)
+  })
 })
 
 describe("isMetricEnabled", () => {

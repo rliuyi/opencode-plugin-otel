@@ -1,5 +1,5 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
-import { SpanStatusCode, SpanKind } from "@opentelemetry/api"
+import { SpanStatusCode, SpanKind, type Span } from "@opentelemetry/api"
 import type { AssistantMessage, EventMessageUpdated, EventMessagePartUpdated, ToolPart } from "@opencode-ai/sdk"
 import {
   AGENT_NAME,
@@ -39,7 +39,7 @@ import {
   isTraceEnabled,
   resolveSessionTraceContext,
 } from "../util.ts"
-import type { HandlerContext } from "../types.ts"
+import { MAX_PENDING, type HandlerContext, type RunDetails } from "../types.ts"
 
 const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
 const LLM_FINISH_REASON = "llm.finish_reason"
@@ -51,6 +51,82 @@ type SubtaskPart = {
   prompt: string
   description: string
   agent: string
+}
+
+function taskMetadata(toolPart: ToolPart) {
+  if (toolPart.tool !== "task" || !("metadata" in toolPart.state)) return
+  const metadata = toolPart.state.metadata
+  if (!metadata || typeof metadata.sessionId !== "string") return
+  const agent = typeof toolPart.state.input.subagent_type === "string"
+    ? toolPart.state.input.subagent_type
+    : undefined
+  return {
+    childSessionID: metadata.sessionId,
+    parentSessionID: typeof metadata.parentSessionId === "string" ? metadata.parentSessionId : toolPart.sessionID,
+    agent,
+    background: metadata.background === true,
+  }
+}
+
+function storePendingSubagentRun(sessionID: string, details: RunDetails, ctx: HandlerContext) {
+  const queued = ctx.pendingSubagentRuns.get(sessionID) ?? []
+  const callIndex = queued.findIndex((item) => item.taskCallID === details.taskCallID)
+  const placeholderIndex = queued.findIndex((item) => !item.taskCallID)
+  const index = callIndex >= 0 ? callIndex : placeholderIndex
+  const next = [...queued]
+  if (index >= 0) next[index] = details
+  else next.push(details)
+  setBoundedMap(ctx.pendingSubagentRuns, sessionID, next.slice(-MAX_PENDING))
+}
+
+function removePendingSubagentRun(sessionID: string, taskCallID: string, ctx: HandlerContext) {
+  const queued = ctx.pendingSubagentRuns.get(sessionID)
+  if (!queued) return
+  const next = queued.filter((details) => details.taskCallID !== taskCallID)
+  if (next.length) setBoundedMap(ctx.pendingSubagentRuns, sessionID, next)
+  else ctx.pendingSubagentRuns.delete(sessionID)
+}
+
+function bindSubagentRun(toolPart: ToolPart, toolSpan: Span | undefined, ctx: HandlerContext) {
+  const task = taskMetadata(toolPart)
+  if (!task) return
+  toolSpan?.setAttributes({
+    "subagent.session.id": task.childSessionID,
+    ...(task.agent ? { "subagent.agent.name": task.agent } : {}),
+    "task.background": task.background,
+  })
+  const activeRunID = ctx.activeRuns.get(task.childSessionID)
+  const activeDetails = ctx.activeRunDetails.get(task.childSessionID)
+  if (activeRunID && activeDetails?.taskCallID === toolPart.callID) {
+    ctx.runSpans.get(activeRunID)?.setAttributes({
+      "session.parent_id": task.parentSessionID,
+      "task.call_id": toolPart.callID,
+      "task.background": task.background,
+    })
+    setBoundedMap(ctx.activeRunDetails, task.childSessionID, {
+      ...activeDetails,
+      background: task.background,
+    })
+    return
+  }
+  const queued = ctx.pendingSubagentRuns.get(task.childSessionID)
+  const existing = queued?.find((details) => details.taskCallID === toolPart.callID)
+  storePendingSubagentRun(task.childSessionID, {
+    agentType: "subagent",
+    parentSessionID: task.parentSessionID,
+    taskCallID: toolPart.callID,
+    taskSpanContext: toolSpan?.spanContext() ?? existing?.taskSpanContext,
+    background: task.background,
+  }, ctx)
+}
+
+function recordLlmOutputEnd(toolPart: ToolPart, outputEndTime: number, ctx: HandlerContext) {
+  const active = ctx.activeMessageSpans.get(toolPart.sessionID)
+  if (!active || active.messageID !== toolPart.messageID) return
+  setBoundedMap(ctx.activeMessageSpans, toolPart.sessionID, {
+    ...active,
+    outputEndTime: Math.max(active.outputEndTime ?? 0, outputEndTime),
+  })
 }
 
 /**
@@ -67,7 +143,16 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
   if (!assistant.time.completed) return
 
   const { sessionID, modelID, providerID } = assistant
-  const duration = assistant.time.completed - assistant.time.created
+  const msgKey = `${sessionID}:${assistant.id}`
+  const activeMessage = ctx.activeMessageSpans.get(sessionID)
+  const recordedOutputEndTime = activeMessage?.messageID === assistant.id
+    ? activeMessage.outputEndTime ?? assistant.time.completed
+    : assistant.time.completed
+  const outputEndTime = Math.min(
+    assistant.time.completed,
+    Math.max(assistant.time.created, recordedOutputEndTime),
+  )
+  const duration = outputEndTime - assistant.time.created
   const sessionAgent = getSessionAgentMeta(sessionID, ctx)
   const messageAgent = (assistant as AssistantMessage & { agent?: string }).agent ?? assistant.mode
   const agentName = messageAgent || sessionAgent.agentName
@@ -125,7 +210,6 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
     cost_usd: assistant.cost,
   })
 
-  const msgKey = `${sessionID}:${assistant.id}`
   const outputText = ctx.messageOutputs.get(msgKey)
   if (outputText !== undefined) {
     const outputAttrs = {
@@ -133,7 +217,6 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
       [OUTPUT_MIME_TYPE]: MimeType.TEXT,
     }
     ctx.runSpans.get(assistant.parentID)?.setAttributes(outputAttrs)
-    ctx.sessionSpans.get(sessionID)?.setAttributes(outputAttrs)
   }
   const msgSpan = ctx.messageSpans.get(msgKey)
   if (msgSpan) {
@@ -165,7 +248,7 @@ export function handleMessageUpdated(e: EventMessageUpdated, ctx: HandlerContext
     } else {
       msgSpan.setStatus({ code: SpanStatusCode.OK })
     }
-    msgSpan.end(assistant.time.completed)
+    msgSpan.end(outputEndTime)
     ctx.messageSpans.delete(msgKey)
   }
   ctx.messageOutputs.delete(msgKey)
@@ -290,6 +373,16 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
     const key = `${toolPart.sessionID}:${toolPart.callID}`
 
     if (toolPart.state.status === "running") {
+      recordLlmOutputEnd(toolPart, toolPart.state.time.start, ctx)
+      const pending = ctx.pendingToolSpans.get(key)
+      if (pending) {
+        pending.span?.setAttributes({
+          [TOOL_PARAMETERS]: JSON.stringify(toolPart.state.input),
+          [INPUT_VALUE]: JSON.stringify(toolPart.state.input),
+        })
+        bindSubagentRun(toolPart, pending.span, ctx)
+        return
+      }
       const { agentName, agentType } = getSessionAgentMeta(toolPart.sessionID, ctx)
       const toolSpan = isTraceEnabled("tool", ctx)
         ? (() => {
@@ -323,6 +416,7 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
         startMs: toolPart.state.time.start,
         span: toolSpan,
       })
+      bindSubagentRun(toolPart, toolSpan, ctx)
       ctx.log("debug", "otel: tool span started", { sessionID: toolPart.sessionID, tool: toolPart.tool, key })
       return
     }
@@ -347,8 +441,8 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
       })
     }
 
-    if (isTraceEnabled("tool", ctx)) {
-      const toolSpan = pending?.span ?? (() => {
+    const toolSpan = isTraceEnabled("tool", ctx)
+      ? pending?.span ?? (() => {
         return ctx.tracer.startSpan(
           `${ctx.tracePrefix}tool.${toolPart.tool}`,
           {
@@ -370,6 +464,17 @@ export function handleMessagePartUpdated(e: EventMessagePartUpdated, ctx: Handle
           }),
         )
       })()
+      : undefined
+
+    const task = taskMetadata(toolPart)
+    if (task) {
+      if (success && task.background) bindSubagentRun(toolPart, toolSpan, ctx)
+      if (!success || !task.background) {
+        removePendingSubagentRun(task.childSessionID, toolPart.callID, ctx)
+      }
+    }
+
+    if (toolSpan) {
       toolSpan.setAttributes({ [AGENT_NAME]: agentName, "agent.type": agentType })
       toolSpan.setAttribute("tool.success", success)
       if (success) {

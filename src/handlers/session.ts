@@ -1,5 +1,5 @@
 import { SeverityNumber } from "@opentelemetry/api-logs"
-import { SpanStatusCode } from "@opentelemetry/api"
+import { SpanStatusCode, trace } from "@opentelemetry/api"
 import type { EventSessionCreated, EventSessionIdle, EventSessionError, EventSessionStatus } from "@opencode-ai/sdk"
 import {
   AGENT_NAME,
@@ -22,11 +22,11 @@ import {
   isTraceEnabled,
   resolveSessionTraceContext,
 } from "../util.ts"
-import type { HandlerContext, SessionAgentType } from "../types.ts"
+import type { HandlerContext, RunDetails, SessionAgentType } from "../types.ts"
 
 const OPENINFERENCE_SPAN_KIND = SemanticConventions.OPENINFERENCE_SPAN_KIND
 
-/** Starts or refreshes the root run span for a single user turn, keyed by the user message ID. */
+/** Starts or refreshes an agent run span for one user turn. */
 export function handleRunStarted(
   runID: string,
   sessionID: string,
@@ -35,8 +35,10 @@ export function handleRunStarted(
   model: string,
   startTime: number,
   ctx: HandlerContext,
+  details: RunDetails = { agentType: "primary" },
 ) {
   ctx.activeRuns.set(sessionID, runID)
+  setBoundedMap(ctx.activeRunDetails, sessionID, details)
   ctx.pendingRuns.delete(sessionID)
   if (promptText) setBoundedMap(ctx.runInputs, runID, promptText)
   if (!isTraceEnabled("session", ctx)) return
@@ -44,6 +46,11 @@ export function handleRunStarted(
   if (existing) {
     existing.setAttributes({
       [AGENT_NAME]: agent,
+      "agent.type": details.agentType,
+      "session.is_subagent": details.agentType === "subagent",
+      ...(details.parentSessionID ? { "session.parent_id": details.parentSessionID } : {}),
+      ...(details.taskCallID ? { "task.call_id": details.taskCallID } : {}),
+      ...(details.background !== undefined ? { "task.background": details.background } : {}),
       ...(promptText
         ? {
             [INPUT_VALUE]: promptText,
@@ -57,6 +64,12 @@ export function handleRunStarted(
     return
   }
 
+  const parentContext = details.taskSpanContext
+    ? trace.setSpanContext(ctx.rootContext(), details.taskSpanContext)
+    : details.parentSessionID
+      ? resolveSessionTraceContext(details.parentSessionID, ctx)
+      : ctx.rootContext()
+
   const runSpan = ctx.tracer.startSpan(
     `${ctx.tracePrefix}session`,
     {
@@ -65,8 +78,11 @@ export function handleRunStarted(
         [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
         [SESSION_ID]: sessionID,
         [AGENT_NAME]: agent,
-        "agent.type": "primary",
-        "session.is_subagent": false,
+        "agent.type": details.agentType,
+        "session.is_subagent": details.agentType === "subagent",
+        ...(details.parentSessionID ? { "session.parent_id": details.parentSessionID } : {}),
+        ...(details.taskCallID ? { "task.call_id": details.taskCallID } : {}),
+        ...(details.background !== undefined ? { "task.background": details.background } : {}),
         ...(promptText
           ? {
               [INPUT_VALUE]: promptText,
@@ -79,13 +95,13 @@ export function handleRunStarted(
         ...ctx.commonAttrs,
       },
     },
-    ctx.rootContext(),
+    parentContext,
   )
   ctx.runSpans.set(runID, runSpan)
   setBoundedMap(ctx.runSpanContexts, runID, runSpan.spanContext())
 }
 
-/** Increments the session counter, records start time, starts the root session span, and emits a `session.created` log event. */
+/** Records session creation metrics, identity, and pending subagent state. */
 export function handleSessionCreated(e: EventSessionCreated, ctx: HandlerContext) {
   const { id: sessionID, time, parentID } = e.properties.info
   const createdAt = time.created
@@ -96,24 +112,14 @@ export function handleSessionCreated(e: EventSessionCreated, ctx: HandlerContext
   }
   setBoundedMap(ctx.sessionTotals, sessionID, { startMs: createdAt, tokens: 0, cost: 0, messages: 0, agent: "unknown", agentType })
 
-  if (isTraceEnabled("session", ctx) && parentID) {
-    const sessionSpan = ctx.tracer.startSpan(
-      `${ctx.tracePrefix}session`,
-      {
-        startTime: createdAt,
-        attributes: {
-          [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
-          [SESSION_ID]: sessionID,
-          [AGENT_NAME]: "unknown",
-          "agent.type": agentType,
-          "session.is_subagent": isSubagent,
-          ...ctx.commonAttrs,
-        },
-      },
-      resolveSessionTraceContext(parentID, ctx),
-    )
-    ctx.sessionSpans.set(sessionID, sessionSpan)
-    setBoundedMap(ctx.sessionSpanContexts, sessionID, sessionSpan.spanContext())
+  if (parentID) {
+    const existing = ctx.pendingSubagentRuns.get(sessionID)
+    if (!existing?.length) {
+      setBoundedMap(ctx.pendingSubagentRuns, sessionID, [{
+        agentType: "subagent",
+        parentSessionID: parentID,
+      }])
+    }
   }
 
   ctx.emitLog({
@@ -145,6 +151,11 @@ function sweepSession(sessionID: string, ctx: HandlerContext) {
     }
   }
   ctx.pendingRuns.delete(sessionID)
+  const queuedRuns = ctx.pendingSubagentRuns.get(sessionID)
+  const correlatedRuns = queuedRuns?.filter((details) => details.taskCallID)
+  if (correlatedRuns?.length) setBoundedMap(ctx.pendingSubagentRuns, sessionID, correlatedRuns)
+  else ctx.pendingSubagentRuns.delete(sessionID)
+  ctx.activeRunDetails.delete(sessionID)
   const msgPrefix = `${sessionID}:`
   for (const [key, span] of ctx.messageSpans) {
     if (key.startsWith(msgPrefix)) {
@@ -162,7 +173,7 @@ function sweepSession(sessionID: string, ctx: HandlerContext) {
   }
 }
 
-/** Emits a `session.idle` log event, records duration and session total histograms, ends the session span, and clears pending state. */
+/** Records session totals, ends the active run, and clears pending state. */
 export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
   const sessionID = e.properties.sessionID
   const totals = ctx.sessionTotals.get(sessionID)
@@ -187,21 +198,6 @@ export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
     }
   }
 
-  const sessionSpan = ctx.sessionSpans.get(sessionID)
-  if (sessionSpan) {
-    if (totals) {
-      sessionSpan.setAttributes({
-        [AGENT_NAME]: totals.agent,
-        "agent.type": totals.agentType,
-        "session.total_tokens": totals.tokens,
-        "session.total_cost_usd": totals.cost,
-        "session.total_messages": totals.messages,
-      })
-    }
-    sessionSpan.setStatus({ code: SpanStatusCode.OK })
-    sessionSpan.end()
-    ctx.sessionSpans.delete(sessionID)
-  }
   const runID = ctx.activeRuns.get(sessionID)
   if (runID) ctx.activeRuns.delete(sessionID)
   const runSpan = runID ? ctx.runSpans.get(runID) : undefined
@@ -242,7 +238,7 @@ export function handleSessionIdle(e: EventSessionIdle, ctx: HandlerContext) {
   })
 }
 
-/** Emits a `session.error` log event, ends the session span with error status, and clears any pending state for the session. */
+/** Records a session error, ends the active run, and clears pending state. */
 export function handleSessionError(e: EventSessionError, ctx: HandlerContext) {
   const rawID = e.properties.sessionID
   const sessionID = rawID ?? "unknown"
@@ -256,14 +252,6 @@ export function handleSessionError(e: EventSessionError, ctx: HandlerContext) {
   sweepSession(sessionID, ctx)
 
   if (rawID) {
-    const sessionSpan = ctx.sessionSpans.get(rawID)
-    if (sessionSpan) {
-      if (totals) sessionSpan.setAttributes({ [AGENT_NAME]: totals.agent, "agent.type": totals.agentType })
-      sessionSpan.setStatus({ code: SpanStatusCode.ERROR, message: error })
-      sessionSpan.setAttribute("error", error)
-      sessionSpan.end()
-      ctx.sessionSpans.delete(rawID)
-    }
     const runID = ctx.activeRuns.get(rawID)
     if (runID) ctx.activeRuns.delete(rawID)
     const runSpan = runID ? ctx.runSpans.get(runID) : undefined
